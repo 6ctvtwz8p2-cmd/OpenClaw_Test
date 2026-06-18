@@ -30,12 +30,6 @@ export default definePluginEntry({
 
     // ── ЖИВОЕ: эхо на любое входящее — доказывает long-polling и обработку без LLM ──
     //    TODO(кандидат): удали этот эхо-хук, когда подключишь реальный пайплайн ниже.
-    api.on("before_dispatch", async (event /*, ctx */) => {
-      const text = String(event?.content ?? event?.body ?? "").trim();
-      if (!text || text.startsWith("/")) return; // команды и пустое — мимо
-      return { handled: true, text: `echo: ${text}` };
-    });
-
     // ─────────────────────────────────────────────────────────────────────────
     // TODO(кандидат): реализовать пайплайн editor-агента.
     // Ничего из этого в шаблоне не реализовано НАМЕРЕННО.

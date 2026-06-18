@@ -12,27 +12,131 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 export default definePluginEntry({
   id: "agentstub",
   name: "OpenClaw Editor Agent (template)",
-  description: "Skeleton editor-agent: живой echo-пруф + TODO-заглушки пайплайна",
+  description: "Editor agent: search + draft + approval gate",
+
   register(api) {
-    // ── ЖИВОЕ: /start — приветствие, мимо LLM ──
-  api.registerCommand({
-  name: "article",
-  description: "Создать статью по теме",
-  acceptsArgs: false,
-  requireAuth: false,
+    // 1. Поиск через Tavily
+    async function searchWeb(query) {
+      const apiKey = process.env.SEARCH_API_KEY;
 
-  handler: async (ctx) => {
-    const text = ctx.message?.text || ctx.update?.message?.text;
+      const res = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: apiKey,
+        },
+        body: JSON.stringify({
+          query,
+          max_results: 5,
+        }),
+      });
 
-    if (!text) {
-      return {
-        text: "Отправь тему статьи текстом.",
-      };
+      const data = await res.json();
+      return data.results || [];
     }
 
-    return {
-      text: `Ок, тема принята: ${text}`,
-    };
+    // 2. Состояние (очень простое, в памяти)
+    const sessions = {};
+
+    // 📩 3. Команда статьи
+    api.registerCommand({
+      name: "article",
+      description: "Создать статью по теме",
+      acceptsArgs: false,
+      requireAuth: false,
+
+      handler: async (ctx) => {
+        const text =
+          ctx.message?.text || ctx.update?.message?.text;
+
+        if (!text) {
+          return {
+            text: "Отправь тему статьи текстом.",
+          };
+        }
+
+        // сохраняем тему
+        sessions[ctx.user?.id || "default"] = {
+          topic: text,
+          note: "",
+        };
+
+        // поиск
+        const results = await searchWeb(text);
+
+        const sources = results
+          .map((r) => `- ${r.url}`)
+          .join("\n");
+
+        // черновик статьи (пока без LLM — просто каркас)
+        const draft =
+          `📝 ЧЕРНОВИК СТАТЬИ\n\n` +
+          `📌 Тема: ${text}\n\n` +
+          `🔎 Источники:\n${sources}\n\n` +
+          `✍️ Текст:\n` +
+          `На основе найденных источников можно раскрыть тему "${text}".\n` +
+          `(Здесь позже будет генерация через OpenRouter)`;
+
+        return {
+          text: draft,
+          blocks: {
+            type: "buttons",
+            buttons: [
+              { text: "Опубликовать", value: "publish" },
+              { text: "Отклонить", value: "reject" },
+            ],
+          },
+        };
+      },
+    });
+
+    // 🎛 4. Обработка кнопок
+    api.registerInteractiveHandler({
+      channel: "telegram",
+      namespace: "agentstub",
+
+      handler: async (ctx) => {
+        const action = ctx?.data?.value;
+        const userId = ctx.user?.id || "default";
+        const session = sessions[userId];
+
+        if (!session) {
+          return { text: "Нет активной статьи. Отправь новую тему." };
+        }
+
+        // публикация
+        if (action === "publish") {
+          await api.telegram.sendMessage(
+            process.env.TELEGRAM_CHANNEL_ID,
+            `📢 СТАТЬЯ\n\nТема: ${session.topic}`
+          );
+
+          return { text: "Опубликовано в канал ✅" };
+        }
+
+        // отклонение
+        if (action === "reject") {
+          session.note = "rejected";
+
+          return {
+            text:
+              "Ок, напиши что исправить или уточнить по статье.",
+          };
+        }
+
+        return { text: "Неизвестное действие." };
+      },
+    });
+
+    // стартовая проверка
+    api.registerCommand({
+      name: "start",
+      description: "start",
+      handler: async () => ({
+        text:
+          "OpenClaw Editor Agent запущен.\nОтправь тему статьи текстом.",
+      }),
+    });
   },
 });
     // ── ЖИВОЕ: эхо на любое входящее — доказывает long-polling и обработку без LLM ──

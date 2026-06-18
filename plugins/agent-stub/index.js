@@ -11,11 +11,13 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 export default definePluginEntry({
   id: "agentstub",
-  name: "OpenClaw Editor Agent (template)",
-  description: "Editor agent: search + draft + approval gate",
+  name: "OpenClaw Editor Agent",
+  description: "Full pipeline agent: search → generate → draft → approve → publish",
 
   register(api) {
-    // 1. Поиск через Tavily
+    // ----------------------------
+    // 🧠 SEARCH (Tavily)
+    // ----------------------------
     async function searchWeb(query) {
       const apiKey = process.env.SEARCH_API_KEY;
 
@@ -23,7 +25,7 @@ export default definePluginEntry({
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: apiKey,
+          "Authorization": apiKey,
         },
         body: JSON.stringify({
           query,
@@ -35,13 +37,60 @@ export default definePluginEntry({
       return data.results || [];
     }
 
-    // 2. Состояние (очень простое, в памяти)
+    // ----------------------------
+    // ✍️ LLM (OpenRouter)
+    // ----------------------------
+    async function generateArticle(topic, sources) {
+      const apiKey = process.env.OPENROUTER_API_KEY;
+
+      const prompt = `
+Ты редактор новостных статей.
+
+Напиши структурированную статью на русском языке.
+
+ТЕМА:
+${topic}
+
+ИСТОЧНИКИ:
+${sources.map(s => s.url).join("\n")}
+
+ПРАВИЛА:
+- не выдумывай факты
+- используй только источники
+- добавь заголовок
+- 3–6 абзацев
+- короткий вывод
+`;
+
+      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: "openai/gpt-4o-mini",
+          messages: [
+            { role: "user", content: prompt }
+          ]
+        }),
+      });
+
+      const data = await res.json();
+      return data.choices?.[0]?.message?.content || "Ошибка генерации";
+    }
+
+    // ----------------------------
+    // 💾 simple memory
+    // ----------------------------
     const sessions = {};
 
-    // 📩 3. Команда статьи
+    // ----------------------------
+    // 🚀 MAIN COMMAND
+    // ----------------------------
     api.registerCommand({
       name: "article",
-      description: "Создать статью по теме",
+      description: "Generate article",
       acceptsArgs: false,
       requireAuth: false,
 
@@ -50,32 +99,28 @@ export default definePluginEntry({
           ctx.message?.text || ctx.update?.message?.text;
 
         if (!text) {
-          return {
-            text: "Отправь тему статьи текстом.",
-          };
+          return { text: "Отправь тему статьи текстом." };
         }
 
-        // сохраняем тему
+        // save session
         sessions[ctx.user?.id || "default"] = {
           topic: text,
-          note: "",
+          lastSources: [],
         };
 
-        // поиск
+        // search
         const results = await searchWeb(text);
 
-        const sources = results
-          .map((r) => `- ${r.url}`)
-          .join("\n");
+        // generate article
+        const article = await generateArticle(text, results);
 
-        // черновик статьи (пока без LLM — просто каркас)
+        const sources = results.map(r => `- ${r.url}`).join("\n");
+
         const draft =
           `📝 ЧЕРНОВИК СТАТЬИ\n\n` +
-          `📌 Тема: ${text}\n\n` +
-          `🔎 Источники:\n${sources}\n\n` +
-          `✍️ Текст:\n` +
-          `На основе найденных источников можно раскрыть тему "${text}".\n` +
-          `(Здесь позже будет генерация через OpenRouter)`;
+          `📌 ТЕМА: ${text}\n\n` +
+          `🔎 ИСТОЧНИКИ:\n${sources}\n\n` +
+          `✍️ СТАТЬЯ:\n${article}`;
 
         return {
           text: draft,
@@ -83,14 +128,16 @@ export default definePluginEntry({
             type: "buttons",
             buttons: [
               { text: "Опубликовать", value: "publish" },
-              { text: "Отклонить", value: "reject" },
-            ],
-          },
+              { text: "Отклонить", value: "reject" }
+            ]
+          }
         };
-      },
+      }
     });
 
-    // 🎛 4. Обработка кнопок
+    // ----------------------------
+    // 🎛 BUTTON HANDLER
+    // ----------------------------
     api.registerInteractiveHandler({
       channel: "telegram",
       namespace: "agentstub",
@@ -101,41 +148,39 @@ export default definePluginEntry({
         const session = sessions[userId];
 
         if (!session) {
-          return { text: "Нет активной статьи. Отправь новую тему." };
+          return { text: "Нет активной статьи. Отправь тему заново." };
         }
 
-        // публикация
+        // ✅ publish gate
         if (action === "publish") {
           await api.telegram.sendMessage(
             process.env.TELEGRAM_CHANNEL_ID,
-            `📢 СТАТЬЯ\n\nТема: ${session.topic}`
+            `📢 СТАТЬЯ\n\n${session.topic}`
           );
 
           return { text: "Опубликовано в канал ✅" };
         }
 
-        // отклонение
+        // ❌ reject flow
         if (action === "reject") {
-          session.note = "rejected";
-
           return {
-            text:
-              "Ок, напиши что исправить или уточнить по статье.",
+            text: "Ок, напиши что нужно изменить в статье."
           };
         }
 
         return { text: "Неизвестное действие." };
-      },
+      }
     });
 
-    // стартовая проверка
+    // ----------------------------
+    // 🟢 START
+    // ----------------------------
     api.registerCommand({
       name: "start",
-      description: "start",
+      description: "Start bot",
       handler: async () => ({
-        text:
-          "OpenClaw Editor Agent запущен.\nОтправь тему статьи текстом.",
-      }),
+        text: "OpenClaw Editor Agent запущен. Отправь тему статьи."
+      })
     });
   },
 });

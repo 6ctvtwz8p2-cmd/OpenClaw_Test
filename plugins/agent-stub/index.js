@@ -15,19 +15,26 @@ export default definePluginEntry({
   description: "Skeleton editor-agent: живой echo-пруф + TODO-заглушки пайплайна",
   register(api) {
     // ── ЖИВОЕ: /start — приветствие, мимо LLM ──
-    api.registerCommand({
-      name: "start",
-      description: "Запустить бота",
-      acceptsArgs: false,
-      requireAuth: false,
-      handler: () => ({
-        text:
-          "OpenClaw editor-agent (шаблон). Каркас рабочий: пришли любой текст — отвечу эхом.\n" +
-          "Логику агента дописывает кандидат — см. README и TODO в plugins/agent-stub/index.js.",
-        continueAgent: false,
-      }),
-    });
+  api.registerCommand({
+  name: "article",
+  description: "Создать статью по теме",
+  acceptsArgs: false,
+  requireAuth: false,
 
+  handler: async (ctx) => {
+    const text = ctx.message?.text || ctx.update?.message?.text;
+
+    if (!text) {
+      return {
+        text: "Отправь тему статьи текстом.",
+      };
+    }
+
+    return {
+      text: `Ок, тема принята: ${text}`,
+    };
+  },
+});
     // ── ЖИВОЕ: эхо на любое входящее — доказывает long-polling и обработку без LLM ──
     //    TODO(кандидат): удали этот эхо-хук, когда подключишь реальный пайплайн ниже.
     // ─────────────────────────────────────────────────────────────────────────

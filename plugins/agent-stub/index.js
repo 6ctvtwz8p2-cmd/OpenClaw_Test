@@ -15,9 +15,7 @@ export default definePluginEntry({
   description: "Full pipeline agent: search → generate → draft → approve → publish",
 
   register(api) {
-    // ----------------------------
-    // 🧠 SEARCH (Tavily)
-    // ----------------------------
+
     async function searchWeb(query) {
       const apiKey = process.env.SEARCH_API_KEY;
 
@@ -25,7 +23,7 @@ export default definePluginEntry({
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": apiKey,
+          "x-api-key": apiKey,
         },
         body: JSON.stringify({
           query,
@@ -37,27 +35,27 @@ export default definePluginEntry({
       return data.results || [];
     }
 
-    // ----------------------------
-    // ✍️ LLM (OpenRouter)
-    // ----------------------------
-    async function generateArticle(topic, sources) {
+    async function generateArticle(topic, sources, feedback = "") {
       const apiKey = process.env.OPENROUTER_API_KEY;
 
       const prompt = `
 Ты редактор новостных статей.
 
-Напиши структурированную статью на русском языке.
+Напиши статью на русском языке.
 
 ТЕМА:
 ${topic}
 
-ИСТОЧНИКИ:
+ИСТОЧНИКИ (используй только их):
 ${sources.map(s => s.url).join("\n")}
+
+${feedback ? `ИСПРАВЛЕНИЯ ОТ РЕДАКТОРА:\n${feedback}\n` : ""}
 
 ПРАВИЛА:
 - не выдумывай факты
 - используй только источники
-- добавь заголовок
+- обязательно вставляй ссылки
+- заголовок обязателен
 - 3–6 абзацев
 - короткий вывод
 `;
@@ -70,9 +68,7 @@ ${sources.map(s => s.url).join("\n")}
         },
         body: JSON.stringify({
           model: "openai/gpt-4o-mini",
-          messages: [
-            { role: "user", content: prompt }
-          ]
+          messages: [{ role: "user", content: prompt }],
         }),
       });
 
@@ -80,14 +76,8 @@ ${sources.map(s => s.url).join("\n")}
       return data.choices?.[0]?.message?.content || "Ошибка генерации";
     }
 
-    // ----------------------------
-    // 💾 simple memory
-    // ----------------------------
     const sessions = {};
 
-    // ----------------------------
-    // 🚀 MAIN COMMAND
-    // ----------------------------
     api.registerCommand({
       name: "article",
       description: "Generate article",
@@ -95,31 +85,31 @@ ${sources.map(s => s.url).join("\n")}
       requireAuth: false,
 
       handler: async (ctx) => {
-        const text =
-          ctx.message?.text || ctx.update?.message?.text;
+        const text = ctx.message?.text || ctx.update?.message?.text;
 
         if (!text) {
           return { text: "Отправь тему статьи текстом." };
         }
 
-        // save session
-        sessions[ctx.user?.id || "default"] = {
-          topic: text,
-          lastSources: [],
-        };
+        const userId = ctx.user?.id || "default";
 
-        // search
         const results = await searchWeb(text);
 
-        // generate article
         const article = await generateArticle(text, results);
 
-        const sources = results.map(r => `- ${r.url}`).join("\n");
+        sessions[userId] = {
+          topic: text,
+          sources: results,
+          article,
+          feedback: "",
+        };
+
+        const sourcesText = results.map(r => `- ${r.url}`).join("\n");
 
         const draft =
           `📝 ЧЕРНОВИК СТАТЬИ\n\n` +
           `📌 ТЕМА: ${text}\n\n` +
-          `🔎 ИСТОЧНИКИ:\n${sources}\n\n` +
+          `🔎 ИСТОЧНИКИ:\n${sourcesText}\n\n` +
           `✍️ СТАТЬЯ:\n${article}`;
 
         return {
@@ -135,9 +125,6 @@ ${sources.map(s => s.url).join("\n")}
       }
     });
 
-    // ----------------------------
-    // 🎛 BUTTON HANDLER
-    // ----------------------------
     api.registerInteractiveHandler({
       channel: "telegram",
       namespace: "agentstub",
@@ -151,20 +138,43 @@ ${sources.map(s => s.url).join("\n")}
           return { text: "Нет активной статьи. Отправь тему заново." };
         }
 
-        // ✅ publish gate
         if (action === "publish") {
           await api.telegram.sendMessage(
             process.env.TELEGRAM_CHANNEL_ID,
-            `📢 СТАТЬЯ\n\n${session.topic}`
+            `📢 СТАТЬЯ\n\n${session.article}`
           );
 
           return { text: "Опубликовано в канал ✅" };
         }
 
-        // ❌ reject flow
         if (action === "reject") {
+          const feedback = ctx.message?.text || "Нужно улучшить статью";
+
+          session.feedback = feedback;
+
+          const newArticle = await generateArticle(
+            session.topic,
+            session.sources,
+            feedback
+          );
+
+          session.article = newArticle;
+
+          const sourcesText = session.sources.map(r => `- ${r.url}`).join("\n");
+
           return {
-            text: "Ок, напиши что нужно изменить в статье."
+            text:
+              `📝 ОБНОВЛЁННЫЙ ЧЕРНОВИК\n\n` +
+              `📌 ТЕМА: ${session.topic}\n\n` +
+              `🔎 ИСТОЧНИКИ:\n${sourcesText}\n\n` +
+              `✍️ СТАТЬЯ:\n${newArticle}`,
+            blocks: {
+              type: "buttons",
+              buttons: [
+                { text: "Опубликовать", value: "publish" },
+                { text: "Отклонить", value: "reject" }
+              ]
+            }
           };
         }
 
@@ -172,9 +182,6 @@ ${sources.map(s => s.url).join("\n")}
       }
     });
 
-    // ----------------------------
-    // 🟢 START
-    // ----------------------------
     api.registerCommand({
       name: "start",
       description: "Start bot",

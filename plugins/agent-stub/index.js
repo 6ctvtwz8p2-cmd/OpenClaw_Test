@@ -10,42 +10,31 @@ export default definePluginEntry({
     const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 
     const drafts = new Map();
-    const awaitingFeedback = new Map();
 
+    // ─────────────────────────────────────────────
+    // /start
+    // ─────────────────────────────────────────────
     api.registerCommand({
       name: "start",
       description: "Start bot",
       handler: () => ({
         text:
           "Editor-agent активирован.\n\n" +
-          "Отправь тему → я соберу статью + источники → отправлю черновик.\n" +
-          "Дальше ты можешь опубликовать или отклонить.",
+          "Отправь тему через /demo или текстом (если платформа поддерживает before_dispatch).\n" +
+          "Я соберу статью и источники, затем отправлю черновик с кнопками.",
         continueAgent: false,
       }),
     });
 
-    api.on("message", async (event) => {
-      const text = String(event?.content ?? "").trim();
-      const chatId = event?.chatId || event?.senderId;
+    // ─────────────────────────────────────────────
+    // /demo — тест генерации статьи + кнопки
+    // ─────────────────────────────────────────────
+    api.registerCommand({
+      name: "demo",
+      description: "Demo article pipeline",
+      handler: async () => {
+        const topic = "Искусственный интеллект";
 
-      if (!text || text.startsWith("/")) return;
-
-      const draftId = awaitingFeedback.get(chatId);
-
-      if (draftId) {
-        awaitingFeedback.delete(chatId);
-
-        const draft = drafts.get(draftId);
-        if (!draft) return;
-
-        return runPipeline(api, chatId, draft.topic, text, true, draftId);
-      }
-
-      return runPipeline(api, chatId, text);
-    });
-
-    async function runPipeline(api, chatId, topic, feedback = null, isRewrite = false, existingDraftId = null) {
-      try {
         const searchRes = await api.runtime.webSearch.search({
           args: { query: topic },
         });
@@ -60,9 +49,7 @@ export default definePluginEntry({
         }));
 
         const prompt = `
-Ты редактор новостного агентства.
-
-Напиши структурированную статью на тему: "${topic}".
+Напиши короткую статью на тему: "${topic}".
 
 Используй источники:
 ${sources.map(s => `[${s.id}] ${s.title} - ${s.url}`).join("\n")}
@@ -70,72 +57,50 @@ ${sources.map(s => `[${s.id}] ${s.title} - ${s.url}`).join("\n")}
 Правила:
 - нейтральный стиль
 - структура: заголовки + абзацы
-- обязательно ссылки вида [1], [2]
-- используй только данные из источников
-
-${feedback ? `\nЗамечания пользователя:\n${feedback}` : ""}
+- ссылки вида [1], [2]
 `;
 
         const out = await api.runtime.llm.complete({
           messages: [{ role: "user", content: prompt }],
         });
 
-        const article = out?.text || "Ошибка генерации статьи";
+        const article = out?.text || "Ошибка генерации";
 
-        const draftId = existingDraftId || crypto.randomUUID();
+        const draftId = crypto.randomUUID();
 
-        const draft = {
-          chatId,
+        drafts.set(draftId, {
           topic,
           article,
           sources,
-        };
-
-        drafts.set(draftId, draft);
-
-        await api.runtime.sendMessage({
-          channel: "telegram",
-          to: TELEGRAM_CHANNEL_ID,
-          content: {
-            text:
-              article +
-              "\n\nИсточники:\n" +
-              sources.map(s => `[${s.id}] ${s.url}`).join("\n"),
-            presentation: {
-              blocks: [
-                {
-                  type: "buttons",
-                  buttons: [
-                    {
-                      label: "Опубликовать",
-                      value: `editor:publish:${draftId}`,
-                      style: "primary",
-                    },
-                    {
-                      label: "Отклонить",
-                      value: `editor:reject:${draftId}`,
-                      style: "danger",
-                    },
-                  ],
-                },
-              ],
-            },
-          },
         });
 
-        return { handled: true };
-      } catch (err) {
         return {
-          handled: true,
-          error: true,
-          message: err?.message || "Pipeline error",
+          text:
+            article +
+            "\n\nИсточники:\n" +
+            sources.map(s => `[${s.id}] ${s.url}`).join("\n"),
+          presentation: {
+            blocks: [
+              {
+                type: "buttons",
+                buttons: [
+                  { label: "Опубликовать", value: `editor:publish:${draftId}`, style: "primary" },
+                  { label: "Отклонить", value: `editor:reject:${draftId}`, style: "danger" },
+                ],
+              },
+            ],
+          },
         };
-      }
-    }
+      },
+    });
 
+    // ─────────────────────────────────────────────
+    // кнопки (publish / reject)
+    // ─────────────────────────────────────────────
     api.registerInteractiveHandler({
       channel: "telegram",
       namespace: "editor",
+
       handler: async (ctx) => {
         const payload = ctx?.callback?.payload;
         const chatId = ctx?.callback?.chatId;
@@ -143,12 +108,11 @@ ${feedback ? `\nЗамечания пользователя:\n${feedback}` : ""}
         if (!payload) return { handled: true };
 
         const [action, , draftId] = payload.split(":");
-
         const draft = drafts.get(draftId);
 
         if (!draft) {
           await ctx.respond.editMessage({
-            text: "❌ Черновик не найден или устарел",
+            text: "❌ Черновик не найден",
           });
           return { handled: true };
         }
@@ -163,7 +127,7 @@ ${feedback ? `\nЗамечания пользователя:\n${feedback}` : ""}
           });
 
           await ctx.respond.editMessage({
-            text: "✅ Статья опубликована",
+            text: "✅ Опубликовано",
           });
 
           drafts.delete(draftId);
@@ -171,10 +135,8 @@ ${feedback ? `\nЗамечания пользователя:\n${feedback}` : ""}
         }
 
         if (action === "reject") {
-          awaitingFeedback.set(chatId, draftId);
-
           await ctx.respond.editMessage({
-            text: "✋ Отклонено. Напиши, что нужно исправить.",
+            text: "✋ Отклонено. (в новом шаблоне можно добавить доработку)",
           });
 
           return { handled: true };

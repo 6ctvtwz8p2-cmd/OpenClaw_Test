@@ -8,186 +8,191 @@
 // Логика намеренно НЕ реализована: это и оценивается у кандидата.
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import crypto from "crypto";
 
 export default definePluginEntry({
   id: "agentstub",
   name: "OpenClaw Editor Agent",
-  description: "Full pipeline agent: search → generate → draft → approve → publish",
+  description: "Editor agent: web search → LLM article → draft approval → publish",
 
   register(api) {
+    const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 
-    async function searchWeb(query) {
-      const apiKey = process.env.SEARCH_API_KEY;
-
-      const res = await fetch("https://api.tavily.com/search", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-        },
-        body: JSON.stringify({
-          query,
-          max_results: 5,
-        }),
-      });
-
-      const data = await res.json();
-      return data.results || [];
-    }
-
-    async function generateArticle(topic, sources, feedback = "") {
-      const apiKey = process.env.OPENROUTER_API_KEY;
-
-      const prompt = `
-Ты редактор новостных статей.
-
-Напиши статью на русском языке.
-
-ТЕМА:
-${topic}
-
-ИСТОЧНИКИ (используй только их):
-${sources.map(s => s.url).join("\n")}
-
-${feedback ? `ИСПРАВЛЕНИЯ ОТ РЕДАКТОРА:\n${feedback}\n` : ""}
-
-ПРАВИЛА:
-- не выдумывай факты
-- используй только источники
-- обязательно вставляй ссылки
-- заголовок обязателен
-- 3–6 абзацев
-- короткий вывод
-`;
-
-      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: "openai/gpt-4o-mini",
-          messages: [{ role: "user", content: prompt }],
-        }),
-      });
-
-      const data = await res.json();
-      return data.choices?.[0]?.message?.content || "Ошибка генерации";
-    }
-
-    const sessions = {};
-
-    api.registerCommand({
-      name: "article",
-      description: "Generate article",
-      acceptsArgs: false,
-      requireAuth: false,
-
-      handler: async (ctx) => {
-        const text = ctx.message?.text || ctx.update?.message?.text;
-
-        if (!text) {
-          return { text: "Отправь тему статьи текстом." };
-        }
-
-        const userId = ctx.user?.id || "default";
-
-        const results = await searchWeb(text);
-
-        const article = await generateArticle(text, results);
-
-        sessions[userId] = {
-          topic: text,
-          sources: results,
-          article,
-          feedback: "",
-        };
-
-        const sourcesText = results.map(r => `- ${r.url}`).join("\n");
-
-        const draft =
-          `📝 ЧЕРНОВИК СТАТЬИ\n\n` +
-          `📌 ТЕМА: ${text}\n\n` +
-          `🔎 ИСТОЧНИКИ:\n${sourcesText}\n\n` +
-          `✍️ СТАТЬЯ:\n${article}`;
-
-        return {
-          text: draft,
-          blocks: {
-            type: "buttons",
-            buttons: [
-              { text: "Опубликовать", value: "publish" },
-              { text: "Отклонить", value: "reject" }
-            ]
-          }
-        };
-      }
-    });
-
-    api.registerInteractiveHandler({
-      channel: "telegram",
-      namespace: "agentstub",
-
-      handler: async (ctx) => {
-        const action = ctx?.data?.value;
-        const userId = ctx.user?.id || "default";
-        const session = sessions[userId];
-
-        if (!session) {
-          return { text: "Нет активной статьи. Отправь тему заново." };
-        }
-
-        if (action === "publish") {
-          await api.telegram.sendMessage(
-            process.env.TELEGRAM_CHANNEL_ID,
-            `📢 СТАТЬЯ\n\n${session.article}`
-          );
-
-          return { text: "Опубликовано в канал ✅" };
-        }
-
-        if (action === "reject") {
-          const feedback = ctx.message?.text || "Нужно улучшить статью";
-
-          session.feedback = feedback;
-
-          const newArticle = await generateArticle(
-            session.topic,
-            session.sources,
-            feedback
-          );
-
-          session.article = newArticle;
-
-          const sourcesText = session.sources.map(r => `- ${r.url}`).join("\n");
-
-          return {
-            text:
-              `📝 ОБНОВЛЁННЫЙ ЧЕРНОВИК\n\n` +
-              `📌 ТЕМА: ${session.topic}\n\n` +
-              `🔎 ИСТОЧНИКИ:\n${sourcesText}\n\n` +
-              `✍️ СТАТЬЯ:\n${newArticle}`,
-            blocks: {
-              type: "buttons",
-              buttons: [
-                { text: "Опубликовать", value: "publish" },
-                { text: "Отклонить", value: "reject" }
-              ]
-            }
-          };
-        }
-
-        return { text: "Неизвестное действие." };
-      }
-    });
+    const drafts = new Map();
+    const awaitingFeedback = new Map();
 
     api.registerCommand({
       name: "start",
       description: "Start bot",
-      handler: async () => ({
-        text: "OpenClaw Editor Agent запущен. Отправь тему статьи."
-      })
+      handler: () => ({
+        text:
+          "Editor-agent активирован.\n\n" +
+          "Отправь тему → я соберу статью + источники → отправлю черновик.\n" +
+          "Дальше ты можешь опубликовать или отклонить.",
+        continueAgent: false,
+      }),
+    });
+
+    api.on("message", async (event) => {
+      const text = String(event?.content ?? "").trim();
+      const chatId = event?.chatId || event?.senderId;
+
+      if (!text || text.startsWith("/")) return;
+
+      const draftId = awaitingFeedback.get(chatId);
+
+      if (draftId) {
+        awaitingFeedback.delete(chatId);
+
+        const draft = drafts.get(draftId);
+        if (!draft) return;
+
+        return runPipeline(api, chatId, draft.topic, text, true, draftId);
+      }
+
+      return runPipeline(api, chatId, text);
+    });
+
+    async function runPipeline(api, chatId, topic, feedback = null, isRewrite = false, existingDraftId = null) {
+      try {
+        const searchRes = await api.runtime.webSearch.search({
+          args: { query: topic },
+        });
+
+        const results = searchRes?.result?.results || [];
+
+        const sources = results.slice(0, 5).map((r, i) => ({
+          id: i + 1,
+          title: r.title,
+          url: r.url,
+          content: r.content,
+        }));
+
+        const prompt = `
+Ты редактор новостного агентства.
+
+Напиши структурированную статью на тему: "${topic}".
+
+Используй источники:
+${sources.map(s => `[${s.id}] ${s.title} - ${s.url}`).join("\n")}
+
+Правила:
+- нейтральный стиль
+- структура: заголовки + абзацы
+- обязательно ссылки вида [1], [2]
+- используй только данные из источников
+
+${feedback ? `\nЗамечания пользователя:\n${feedback}` : ""}
+`;
+
+        const out = await api.runtime.llm.complete({
+          messages: [{ role: "user", content: prompt }],
+        });
+
+        const article = out?.text || "Ошибка генерации статьи";
+
+        const draftId = existingDraftId || crypto.randomUUID();
+
+        const draft = {
+          chatId,
+          topic,
+          article,
+          sources,
+        };
+
+        drafts.set(draftId, draft);
+
+        const message = {
+          channel: "telegram",
+          to: TELEGRAM_CHANNEL_ID,
+          content: {
+            text:
+              article +
+              "\n\nИсточники:\n" +
+              sources.map(s => `[${s.id}] ${s.url}`).join("\n"),
+            presentation: {
+              blocks: [
+                {
+                  type: "buttons",
+                  buttons: [
+                    {
+                      label: "Опубликовать",
+                      value: `editor:publish:${draftId}`,
+                      style: "primary",
+                    },
+                    {
+                      label: "Отклонить",
+                      value: `editor:reject:${draftId}`,
+                      style: "danger",
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        };
+
+        const sent = await api.runtime.sendMessage(message);
+
+        return { handled: true, sent };
+      } catch (err) {
+        return {
+          handled: true,
+          error: true,
+          message: err?.message || "Pipeline error",
+        };
+      }
+    }
+
+    api.registerInteractiveHandler({
+      channel: "telegram",
+      namespace: "editor",
+      handler: async (ctx) => {
+        const payload = ctx?.callback?.payload;
+        const chatId = ctx?.callback?.chatId;
+
+        if (!payload) return { handled: true };
+
+        const [action, , draftId] = payload.split(":");
+
+        const draft = drafts.get(draftId);
+
+        if (!draft) {
+          await ctx.respond.editMessage({
+            text: "❌ Черновик не найден или устарел",
+          });
+          return { handled: true };
+        }
+
+        if (action === "publish") {
+          await api.runtime.sendMessage({
+            channel: "telegram",
+            to: TELEGRAM_CHANNEL_ID,
+            content: {
+              text: draft.article,
+            },
+          });
+
+          await ctx.respond.editMessage({
+            text: "✅ Статья опубликована",
+          });
+
+          drafts.delete(draftId);
+          return { handled: true };
+        }
+
+        if (action === "reject") {
+          awaitingFeedback.set(chatId, draftId);
+
+          await ctx.respond.editMessage({
+            text: "✋ Отклонено. Напиши, что нужно исправить.",
+          });
+
+          return { handled: true };
+        }
+
+        return { handled: true };
+      },
     });
   },
 });
